@@ -1,282 +1,232 @@
 # app.py
-import os
-from pathlib import Path
-import tempfile
 import io
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-import rasterio
-from rasterstats import zonal_stats
 import matplotlib.pyplot as plt
 import streamlit as st
 
 # --------------------
-# Config / paths
+# Paths / config
 # --------------------
 BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "data"
-DEFAULT_RASTER = DATA_DIR / "tmin_raster.tif"
+NOTEBOOKS_DIR = BASE / "notebooks"
+
+DEFAULT_CSV = DATA_DIR / "estadisticas_tmin.csv"
 DEFAULT_VECTOR = DATA_DIR / "DISTRITOS.shp"
 
 st.set_page_config(page_title="Perú Tmin — Zonal Stats", layout="wide")
 st.title("Perú Tmin — Estadísticas zonales y políticas públicas")
 
 # --------------------
-# Helpers
+# Utility: safe read CSV (try comma then tab)
 # --------------------
-def ensure_geometry_column(gdf):
-    """If geometry column isn't named 'geometry', set it to the first geometry dtype column."""
-    if "geometry" not in gdf.columns:
-        geom_cols = [c for c in gdf.columns if gdf[c].dtype.name == "geometry"]
-        if geom_cols:
-            gdf = gdf.set_geometry(geom_cols[0])
-    return gdf
-
-def detect_name_column(gdf):
-    """Return a name column to label polygons for tables/plots (create if none)."""
-    candidates = ["DISTRITO", "NOMB_DIST", "NOMBDIST", "NOMBRE", "NAME", "DISTRICT", "DIST"]
-    for c in candidates:
-        if c in gdf.columns:
-            return c
-    # fallback: create 'NAME' from index
-    gdf["NAME"] = gdf.index.astype(str)
-    return "NAME"
-
-def compute_zonal_stats(vector_gdf, raster_path):
-    """Compute zonal stats and a custom frost metric (pct pixels < 0). Return GeoDataFrame (lowercase cols)."""
-    # open raster to get crs and nodata
-    with rasterio.open(raster_path) as src:
-        raster_crs = src.crs
-        nodata = src.nodata
-
-    gdf = vector_gdf.copy()
-    gdf = ensure_geometry_column(gdf)
-
-    # Reproject to raster CRS for correct overlay
-    if gdf.crs is None:
-        gdf = gdf.set_crs("EPSG:4326")
-    if raster_crs is not None:
+def read_stats_csv(path):
+    try:
+        df = pd.read_csv(path)
+        return df
+    except Exception:
         try:
-            gdf = gdf.to_crs(raster_crs)
-        except Exception:
-            pass
-
-    # Use rasterstats: base stats + percentiles + custom frost count
-    stats = ["count", "min", "max", "mean", "std"]
-    percentiles = [10, 90]
-
-    try:
-        zs = zonal_stats(
-            gdf.geometry,
-            raster_path,
-            stats=stats,
-            percentiles=percentiles,
-            add_stats={"frost_pixels": lambda arr: int(np.sum(np.array(arr) < 0))},
-            nodata=nodata,
-            geojson_out=False,
-            all_touched=False
-        )
-    except Exception as e:
-        raise RuntimeError(f"Error en zonal_stats: {e}")
-
-    df = pd.DataFrame(zs)
-
-    # Ensure percentile keys normalized: rasterstats may name them 'percentile_10' etc.
-    if "percentile_10" in df.columns:
-        df["p10"] = df["percentile_10"]
-    elif "10" in df.columns:
-        df["p10"] = df["10"]
-    if "percentile_90" in df.columns:
-        df["p90"] = df["percentile_90"]
-    elif "90" in df.columns:
-        df["p90"] = df["90"]
-
-    # Merge geometry back
-    out = pd.concat([gdf.reset_index(drop=True), df], axis=1)
-
-    # normalize column names to lowercase for consistency with your saved CSV
-    rename_map = {}
-    for c in ["mean", "min", "max", "std", "count"]:
-        if c in out.columns:
-            rename_map[c] = c  # already lowercase
-    # ensure frost_pixels present
-    if "frost_pixels" not in out.columns and "FROST_PIXELS" in out.columns:
-        out["frost_pixels"] = out["FROST_PIXELS"]
-
-    # compute frost_pct
-    out["pixels"] = out.get("count", np.nan)
-    out["frost_pixels"] = out.get("frost_pixels", 0)
-    out["frost_pct"] = np.where(out["pixels"] > 0, out["frost_pixels"] / out["pixels"] * 100, 0.0)
-
-    # keep important cols lowercase
-    # already many are lowercase (mean,min,max,std,p10,p90)
-    return gpd.GeoDataFrame(out, geometry="geometry")
-
-def plot_hist_mean(gdf):
-    fig, ax = plt.subplots(figsize=(7, 3.5))
-    if "mean" in gdf.columns:
-        ser = gdf["mean"].dropna()
-    elif "MEAN" in gdf.columns:
-        ser = gdf["MEAN"].dropna()
-    else:
-        ser = pd.Series(dtype=float)
-    ax.hist(ser, bins=40, edgecolor="black", alpha=0.7)
-    ax.set_xlabel("Mean Tmin (°C)")
-    ax.set_ylabel("Count")
-    ax.set_title("Distribución de la Tmin promedio por polígono")
-    plt.tight_layout()
-    return fig
-
-def plot_top_tables(gdf, name_col, n=15):
-    # Use 'mean' lowercase where available
-    mean_col = "mean" if "mean" in gdf.columns else ("MEAN" if "MEAN" in gdf.columns else None)
-    p10_col = "p10" if "p10" in gdf.columns else ("P10" if "P10" in gdf.columns else None)
-    p90_col = "p90" if "p90" in gdf.columns else ("P90" if "P90" in gdf.columns else None)
-    frost_pct_col = "frost_pct" if "frost_pct" in gdf.columns else ("FROST_PCT" if "FROST_PCT" in gdf.columns else None)
-
-    if mean_col is None:
-        raise RuntimeError("No se encontró columna 'mean' en los resultados zonales.")
-
-    cold_cols = [name_col, mean_col]
-    if p10_col:
-        cold_cols.append(p10_col)
-    if frost_pct_col:
-        cold_cols.append(frost_pct_col)
-
-    hot_cols = [name_col, mean_col]
-    if p90_col:
-        hot_cols.append(p90_col)
-
-    cold = gdf.nsmallest(n, mean_col)[cold_cols].copy()
-    hot = gdf.nlargest(n, mean_col)[hot_cols].copy()
-
-    # rename to friendly names for display
-    cold = cold.rename(columns={mean_col: "mean", p10_col: "p10", frost_pct_col: "frost_pct"})
-    hot = hot.rename(columns={mean_col: "mean", p90_col: "p90"})
-
-    return cold.reset_index(drop=True), hot.reset_index(drop=True)
-
-def plot_choropleth_png(gdf, value_col="mean"):
-    fig, ax = plt.subplots(1, 1, figsize=(8, 10))
-    col = value_col if value_col in gdf.columns else ("MEAN" if "MEAN" in gdf.columns else None)
-    if col is None:
-        raise RuntimeError("No hay columna para mapear.")
-    gdf.plot(column=col, ax=ax, legend=True, cmap="coolwarm", edgecolor="0.6", linewidth=0.2)
-    ax.set_axis_off()
-    ax.set_title(f"Choropleth: {col}")
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
-    buf.seek(0)
-    plt.close(fig)
-    return buf
+            df = pd.read_csv(path, sep="\t")
+            return df
+        except Exception as e:
+            raise RuntimeError(f"Error leyendo CSV: {e}")
 
 # --------------------
-# Sidebar: Uploads / defaults
+# Load CSV and shapefile
 # --------------------
-st.sidebar.header("Datos")
-uploaded_raster = st.sidebar.file_uploader("Sube un GeoTIFF (opcional)", type=["tif", "tiff"])
-uploaded_vector = st.sidebar.file_uploader("Sube un shapefile (.shp) o GeoJSON (opcional)", type=["geojson", "json", "shp"])
-
-# choose raster path (uploaded overrides default)
-if uploaded_raster is not None:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
-    tmp.write(uploaded_raster.read())
-    tmp.flush()
-    raster_path = tmp.name
-else:
-    raster_path = str(DEFAULT_RASTER) if DEFAULT_RASTER.exists() else None
-
-# choose vector path
-if uploaded_vector is not None:
-    tmpv = tempfile.NamedTemporaryFile(delete=False, suffix=".geojson")
-    tmpv.write(uploaded_vector.read())
-    tmpv.flush()
-    vector_path = tmpv.name
-else:
-    vector_path = str(DEFAULT_VECTOR) if DEFAULT_VECTOR.exists() else None
-
-if raster_path is None:
-    st.error("No se encontró ráster. Sube un GeoTIFF o coloca uno en ./data/tmin_raster.tif")
+try:
+    df = read_stats_csv(DEFAULT_CSV)
+except Exception as e:
+    st.error(str(e))
     st.stop()
 
-if vector_path is None:
-    st.error("No se encontró shapefile/geojson. Sube uno o coloca DISTRITOS.shp en ./data/")
+try:
+    gdf = gpd.read_file(DEFAULT_VECTOR)
+except Exception as e:
+    st.error(f"No se pudo leer el shapefile: {e}")
     st.stop()
 
-st.sidebar.markdown("---")
-st.sidebar.write(f"Ráster usado: `{Path(raster_path).name}`")
-st.sidebar.write(f"Vector usado: `{Path(vector_path).name}`")
+# normalize column names
+df.columns = [c for c in df.columns]
 
 # --------------------
-# Load vector & compute
+# Show full table
 # --------------------
-with st.spinner("Cargando límites..."):
-    try:
-        gdf = gpd.read_file(vector_path)
-    except Exception as e:
-        st.error(f"Error leyendo vector: {e}")
-        st.stop()
+st.header("Resultados (CSV)")
+st.markdown(f"- Distritos en tabla: **{len(df)}**")
+st.dataframe(df, use_container_width=True)
 
-    gdf = ensure_geometry_column(gdf)
-    name_col = detect_name_column(gdf)
-
-with st.spinner("Calculando estadísticas zonales (puede tardar)..."):
-    try:
-        zonal = compute_zonal_stats(gdf, raster_path)
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
+# CSV download
+csv_bytes = df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "Descargar CSV (estadísticas zonales)",
+    csv_bytes,
+    file_name="tmin_zonal_stats.csv",
+    mime="text/csv"
+)
 
 # --------------------
-# Show results: table + CSV download
-# --------------------
-st.header("Resultados")
-st.markdown(f"- Polígonos: **{len(zonal)}**")
-display_cols = [name_col, "mean", "min", "max", "std", "p10", "p90", "frost_pct"]
-display_cols = [c for c in display_cols if c in zonal.columns]
-st.dataframe(zonal[display_cols].head(20))
-
-# CSV download (use lowercase names for portability)
-out_df = zonal.drop(columns=[c for c in ["geometry"] if "geometry" in zonal.columns], errors="ignore")
-# ensure columns as in your example: UBIGEO, DEPARTAMEN, PROVINCIA, DISTRITO, year, count, mean, min...
-# if those exist already keep them; otherwise export the computed table
-csv_bytes = out_df.to_csv(index=False).encode("utf-8")
-st.download_button("Descargar CSV (estadísticas zonales)", csv_bytes, file_name="tmin_zonal_stats.csv", mime="text/csv")
-
-# --------------------
-# Plots: distribution, ranking, map
+# Visualizaciones
 # --------------------
 st.header("Visualizaciones")
 
-# 1) Distribution
-fig_hist = plot_hist_mean(zonal)
-st.subheader("Distribución")
-st.pyplot(fig_hist)
+# Histogram of mean
+if "mean" in df.columns:
+    mean_col = "mean"
+elif "MEAN" in df.columns:
+    mean_col = "MEAN"
+else:
+    mean_col = None
 
-# 2) Ranking (top 15 cold/hot)
+if mean_col:
+    fig, ax = plt.subplots(figsize=(8, 3.5))
+    ax.hist(df[mean_col].dropna(), bins=40, edgecolor="black", alpha=0.75)
+    ax.set_xlabel("Mean Tmin (°C)")
+    ax.set_ylabel("Frequency")
+    ax.set_title("Distribución de la Tmin promedio por distrito")
+    st.subheader("Distribución")
+    st.pyplot(fig)
+else:
+    st.warning("No se encontró la columna 'mean' para graficar la distribución.")
+
+# Top 15 cold / hot
 st.subheader("Clasificación (Top 15)")
-try:
-    cold_df, hot_df = plot_top_tables(zonal, name_col, n=15)
+
+name_col = None
+for cand in ["DISTRITO", "distrito", "DISTRICT", "NOMBDIST", "NAME"]:
+    if cand in df.columns:
+        name_col = cand
+        break
+
+if name_col is None:
+    text_cols = [c for c in df.columns if df[c].dtype == object]
+    name_col = text_cols[0] if text_cols else df.columns[0]
+
+p10_col = "p10" if "p10" in df.columns else ("P10" if "P10" in df.columns else None)
+p90_col = "p90" if "p90" in df.columns else ("P90" if "P90" in df.columns else None)
+
+if mean_col:
+    cold = df.nsmallest(15, mean_col)
+    hot = df.nlargest(15, mean_col)
+
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Top 15 más fríos**")
-        st.table(cold_df.style.format({"mean":"{:.2f}","p10":"{:.2f}","frost_pct":"{:.1f}"}))
+        if len(cold) > 0:
+            st.table(
+                cold[[c for c in [name_col, mean_col, p10_col] if c]]
+                .rename(columns={mean_col: "mean", p10_col: "p10"})
+                .style.format({"mean": "{:.2f}", "p10": "{:.2f}"})
+            )
+        else:
+            st.write("No hay datos para Top fríos.")
     with c2:
         st.markdown("**Top 15 más cálidos**")
-        st.table(hot_df.style.format({"mean":"{:.2f}","p90":"{:.2f}"}))
-except Exception as e:
-    st.warning(f"No se pudo generar ranking completo: {e}")
+        if len(hot) > 0:
+            st.table(
+                hot[[c for c in [name_col, mean_col, p90_col] if c]]
+                .rename(columns={mean_col: "mean", p90_col: "p90"})
+                .style.format({"mean": "{:.2f}", "p90": "{:.2f}"})
+            )
+        else:
+            st.write("No hay datos para Top cálidos.")
+else:
+    st.warning("No hay columna 'mean' para crear rankings.")
 
-# 3) Static map
+# --------------------
+# Choropleth map
+# --------------------
 st.subheader("Mapa estático (choropleth)")
+
+merged = None
 try:
-    png_buf = plot_choropleth_png(zonal, value_col="mean")
-    st.image(png_buf)
-    st.download_button("Descargar mapa (PNG)", data=png_buf.getvalue(), file_name="map_tmin_mean.png", mime="image/png")
+    if "UBIGEO" in df.columns and "UBIGEO" in gdf.columns:
+        df_ = df.copy()
+        gdf_ = gdf.copy()
+        df_["UBIGEO"] = df_["UBIGEO"].astype(str).str.zfill(6)
+        gdf_["UBIGEO"] = gdf_["UBIGEO"].astype(str).str.zfill(6)
+        merged = gdf_.merge(df_, on="UBIGEO")
 except Exception as e:
-    st.warning(f"No se pudo generar el mapa: {e}")
+    st.warning(f"No se pudo realizar merge para mapa: {e}")
+
+if merged is None or len(merged) == 0:
+    st.warning("No se pudo generar el mapa por falta de coincidencia entre shapefile y CSV.")
+else:
+    try:
+        merged = merged.to_crs(epsg=4326)
+    except Exception:
+        pass
+
+    if mean_col and mean_col in merged.columns:
+        fig, ax = plt.subplots(1, 1, figsize=(8, 10))
+        merged.plot(
+            column=mean_col,
+            ax=ax,
+            legend=True,
+            cmap="coolwarm",
+            edgecolor="0.6",
+            linewidth=0.2
+        )
+        ax.set_axis_off()
+        ax.set_title("Choropleth: Mean Tmin (°C)")
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+        buf.seek(0)
+        st.image(buf, caption="Mapa Tmin — Choropleth", use_column_width=True)
+        st.download_button(
+            "Descargar mapa (PNG)",
+            data=buf.getvalue(),
+            file_name="map_tmin_mean.png",
+            mime="image/png"
+        )
+    else:
+        st.warning("No hay columna 'mean' en el dataset fusionado para pintar el mapa.")
+
+
+# --------------------
+# Show pre-rendered figures
+# --------------------
+st.subheader("Figuras pre-renderizadas (notebooks)")
+
+cold_img_path = NOTEBOOKS_DIR / "figures_top15_cold.png"
+hot_img_path = NOTEBOOKS_DIR / "figures_top15_hot.png"
+map_img_path = NOTEBOOKS_DIR / "figures_mapa_tmin.png"
+
+c1, c2 = st.columns(2)
+with c1:
+    if cold_img_path.exists():
+        with open(cold_img_path, "rb") as f:
+            img_bytes = f.read()
+            st.image(img_bytes, caption="Top15 Cold (pre-rendered)", use_column_width=True)
+            st.download_button("Descargar figura cold (PNG)", data=img_bytes,
+                               file_name="figures_top15_cold.png", mime="image/png")
+    else:
+        st.write("No se encontró notebooks/figures_top15_cold.png")
+
+with c2:
+    if hot_img_path.exists():
+        with open(hot_img_path, "rb") as f:
+            img_bytes = f.read()
+            st.image(img_bytes, caption="Top15 Hot (pre-rendered)", use_column_width=True)
+            st.download_button("Descargar figura hot (PNG)", data=img_bytes,
+                               file_name="figures_top15_hot.png", mime="image/png")
+    else:
+        st.write("No se encontró notebooks/figures_top15_hot.png")
+
+st.markdown("---")
+if map_img_path.exists():
+    with open(map_img_path, "rb") as f:
+        img_bytes = f.read()
+        st.image(img_bytes, caption="Mapa Tmin (pre-rendered)", use_column_width=True)
+        st.download_button("Descargar mapa Tmin (PNG)", data=img_bytes,
+                           file_name="figures_mapa_tmin.png", mime="image/png")
+else:
+    st.write("No se encontró notebooks/figures_mapa_tmin.png")
+
 
 # --------------------
 # Public policy section
@@ -284,23 +234,22 @@ except Exception as e:
 st.header("Políticas Públicas — Diagnóstico y medidas priorizadas")
 st.markdown("""
 **Diagnóstico (resumen):**  
-El análisis zonal muestra distritos con P10 ≤ 0°C y altos porcentajes de píxeles bajo 0°C (FROST_PCT) concentrados en zonas altoandinas —esto indica riesgo para agricultura, ganadería y salud (IRA/ARI).
+Los distritos con P10 ≤ 0°C y altos porcentajes de heladas presentan riesgos en agricultura, ganadería y salud.
 
-**Medidas priorizadas (ejemplo):**
+**Medidas priorizadas:**
 
 1. **Kits antihelada para ganadería**  
-   - **Población/territorio:** Productores en distritos con FROST_PCT ≥ 30%.  
-   - **Presupuesto estimado:** S/ 1,000 por familia (kit alimentario + cobertores).  
+   - **Territorio:** Distritos con alto % de heladas.  
+   - **Presupuesto:** S/ 1,000 por familia.  
    - **KPI:** −25% mortalidad de alpacas en 2 años.
 
-2. **Programas de aislamiento térmico en escuelas y postas**  
-   - **Población/territorio:** Instituciones en distritos con P10 ≤ 0°C.  
-   - **Presupuesto estimado:** S/ 6,000 por escuela/posta.  
-   - **KPI:** +10% asistencia escolar durante meses fríos; −15% consultas por ARI en postas.
+2. **Aislamiento térmico en escuelas y postas**  
+   - **Territorio:** Zonas con P10 ≤ 0°C.  
+   - **Presupuesto:** S/ 6,000 por institución.  
+   - **KPI:** +10% asistencia escolar en meses fríos.
 
 3. **Alerta temprana y capacitación comunitaria**  
-   - **Población/territorio:** Comunidades campesinas en provincias más afectadas.  
-   - **Presupuesto estimado:** S/ 3,000 por comunidad (sensores + capacitación).  
-   - **KPI:** Tiempo de respuesta < 48h ante eventos de friaje.
+   - **Territorio:** Comunidades altoandinas.  
+   - **Presupuesto:** S/ 3,000 por comunidad.  
+   - **KPI:** Respuesta < 48h ante eventos de friaje.
 """)
-
