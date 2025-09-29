@@ -1,6 +1,18 @@
-# Peru-Minimum-Temperature
+# 🌡️ Peru-Minimum-Temperature
 
-## Codigo para correr el streamlit.app 
-Paso 1: conda activate enviroment
-Paso 2: cd "directorio"
-Paso 3: streamlit run app.py
+Aplicación desarrollada con **Streamlit** para visualizar y analizar la temperatura mínima en Perú.
+
+---
+
+## 🚀 Cómo ejecutar la app localmente
+
+Sigue estos pasos en tu terminal:
+
+### 1️⃣ Activar el entorno
+conda activate enviroment
+
+### 2️⃣ Ir al directorio del proyecto
+cd "directorio"
+
+### 3️⃣ Ejecutar la aplicación
+streamlit run app.py
